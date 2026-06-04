@@ -458,9 +458,6 @@ func (s *beanjaminCoffee) prepareDrink(ctx context.Context, drink, customerName 
 }
 
 func (s *beanjaminCoffee) grindCoffee(ctx, cancelCtx context.Context) error {
-	// Mark before any motion: any cancel from here onward must clean the
-	// filter before going home, in case the grinder dispensed any grounds.
-	s.portafilterHasGrounds.Store(true)
 	steps := []Step{
 		{PoseName: filterPoseGrinderApproach, Component: componentFilter, Pause: shortPause},
 		{PoseName: filterPoseGrinderActivate, Component: componentFilter, Pause: shortPause, LinearConstraint: defaultApproachConstraint},
@@ -471,6 +468,12 @@ func (s *beanjaminCoffee) grindCoffee(ctx, cancelCtx context.Context) error {
 			LinearConstraint: defaultApproachConstraint},
 	}
 	for _, step := range steps {
+		// Mark grounds only as we reach the activate pose: the approach move
+		// keeps the filter clean, and the grinder dispenses once it's under the
+		// chute. From here onward any cancel must clean the filter before home.
+		if step.PoseName == filterPoseGrinderActivate {
+			s.portafilterHasGrounds.Store(true)
+		}
 		if err := s.executeStep(ctx, cancelCtx, step); err != nil {
 			return fmt.Errorf("grind_coffee: %w", err)
 		}
@@ -479,9 +482,6 @@ func (s *beanjaminCoffee) grindCoffee(ctx, cancelCtx context.Context) error {
 }
 
 func (s *beanjaminCoffee) grindDecaf(ctx, cancelCtx context.Context) error {
-	// Mark before any motion: any cancel from here onward must clean the
-	// filter before going home, in case the grinder dispensed any grounds.
-	s.portafilterHasGrounds.Store(true)
 	steps := []Step{
 		{PoseName: filterPoseDecafGrinderApproach, Component: componentFilter, Pause: shortPause},
 		{PoseName: filterPoseDecafGrinderActivate, Component: componentFilter, Pause: shortPause, LinearConstraint: defaultApproachConstraint},
@@ -492,6 +492,12 @@ func (s *beanjaminCoffee) grindDecaf(ctx, cancelCtx context.Context) error {
 			LinearConstraint: defaultApproachConstraint},
 	}
 	for _, step := range steps {
+		// Mark grounds only as we reach the activate pose: the approach move
+		// keeps the filter clean, and the grinder dispenses once it's under the
+		// chute. From here onward any cancel must clean the filter before home.
+		if step.PoseName == filterPoseDecafGrinderActivate {
+			s.portafilterHasGrounds.Store(true)
+		}
 		if err := s.executeStep(ctx, cancelCtx, step); err != nil {
 			return fmt.Errorf("grind_decaf: %w", err)
 		}
