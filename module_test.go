@@ -25,6 +25,7 @@ func validDynamicConfig() *Config {
 	cfg.DynamicCupPickup = true
 	cfg.CupVisionServiceName = "vis"
 	cfg.SrcCameraName = "cam"
+	cfg.CameraObservePoseSwitcherName = "observe-switch"
 	cfg.ExpectedCupPositionMm = &Vec3Mm{}
 	cfg.CupApproachRelativePose = &RelativePose{}
 	cfg.CupGrabRelativePose = &RelativePose{}
@@ -60,11 +61,23 @@ func TestValidate_DynamicCupPickup_RequiresSrcCameraName(t *testing.T) {
 	}
 }
 
+func TestValidate_DynamicCupPickup_RequiresCameraObservePoseSwitcher(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.DynamicCupPickup = true
+	cfg.CupVisionServiceName = "vis"
+	cfg.SrcCameraName = "cam"
+	_, _, err := cfg.Validate("")
+	if err == nil || !strings.Contains(err.Error(), "camera_observe_pose_switcher_name") {
+		t.Fatalf("expected camera_observe_pose_switcher_name required error, got %v", err)
+	}
+}
+
 func TestValidate_DynamicCupPickup_RequiresExpectedCupPosition(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.DynamicCupPickup = true
 	cfg.CupVisionServiceName = "vis"
 	cfg.SrcCameraName = "cam"
+	cfg.CameraObservePoseSwitcherName = "observe-switch"
 	_, _, err := cfg.Validate("")
 	if err == nil || !strings.Contains(err.Error(), "expected_cup_position_mm") {
 		t.Fatalf("expected expected_cup_position_mm required error, got %v", err)
@@ -110,12 +123,45 @@ func TestValidate_DynamicCupPickup_PreservesExplicitMaxDistance(t *testing.T) {
 	}
 }
 
-func TestValidate_DynamicCupPickup_RejectsNegativeRetries(t *testing.T) {
+func TestValidate_DynamicCupPickup_RejectsNegativePhotosPerVantage(t *testing.T) {
 	cfg := validDynamicConfig()
-	cfg.CupDetectionRetries = -1
+	cfg.CupPhotosPerVantage = -1
 	_, _, err := cfg.Validate("")
-	if err == nil || !strings.Contains(err.Error(), "cup_detection_retries") {
-		t.Fatalf("expected cup_detection_retries error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "cup_photos_per_vantage") {
+		t.Fatalf("expected cup_photos_per_vantage error, got %v", err)
+	}
+}
+
+func TestParseCupFlowCount(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      interface{}
+		want    int
+		wantErr bool
+	}{
+		{"number", float64(5), 5, false},
+		{"true means one", true, 1, false},
+		{"zero rejected", float64(0), 0, true},
+		{"negative rejected", float64(-2), 0, true},
+		{"large count ok", float64(500), 500, false},
+		{"wrong type rejected", "3", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseCupFlowCount(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got count %d", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -153,7 +199,7 @@ func TestValidate_DynamicCupPickup_AppendsDeps(t *testing.T) {
 	}
 	wantVis := vision.Named("vis").String()
 	wantCam := camera.Named("cam").String()
-	var sawVision, sawCamera bool
+	var sawVision, sawCamera, sawObserveSwitch bool
 	for _, d := range req {
 		if d == wantVis {
 			sawVision = true
@@ -161,11 +207,17 @@ func TestValidate_DynamicCupPickup_AppendsDeps(t *testing.T) {
 		if d == wantCam {
 			sawCamera = true
 		}
+		if d == "observe-switch" {
+			sawObserveSwitch = true
+		}
 	}
 	if !sawVision {
 		t.Fatalf("expected vision dep in required deps, got %v", req)
 	}
 	if !sawCamera {
 		t.Fatalf("expected camera dep in required deps, got %v", req)
+	}
+	if !sawObserveSwitch {
+		t.Fatalf("expected cup observe switch dep in required deps, got %v", req)
 	}
 }
