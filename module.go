@@ -468,6 +468,14 @@ func NewCoffee(ctx context.Context, deps resource.Dependencies, name resource.Na
 		cupVision:            cupVision,
 		cupCameraName:        cupCameraName,
 	}
+
+	// Fail fast if the enabled configuration references poses that are missing
+	// from (or unset on) the switches, rather than discovering it mid-order.
+	if err := s.validateConfiguredPoses(ctx); err != nil {
+		cancelFunc()
+		return nil, err
+	}
+
 	go s.processQueue()
 	return s, nil
 }
@@ -780,7 +788,7 @@ func (s *beanjaminCoffee) cancel(ctx context.Context) (map[string]interface{}, e
 			return nil, fmt.Errorf("cancel: recovery clean_portafilter: %w", err)
 		}
 		s.setStep("Finishing up")
-		homeStep := Step{PoseName: "home", Component: "filter"}
+		homeStep := Step{PoseName: filterPoseHome, Component: "filter"}
 		if err := s.executeStep(ctx, cancelCtx, homeStep); err != nil {
 			return nil, fmt.Errorf("cancel: recovery home: %w", err)
 		}
@@ -793,7 +801,7 @@ func (s *beanjaminCoffee) cancel(ctx context.Context) (map[string]interface{}, e
 			return nil, fmt.Errorf("cancel: recovery clean_portafilter: %w", err)
 		}
 		s.setStep("Finishing up")
-		homeStep := Step{PoseName: "home", Component: "filter"}
+		homeStep := Step{PoseName: filterPoseHome, Component: "filter"}
 		if err := s.executeStep(ctx, cancelCtx, homeStep); err != nil {
 			return nil, fmt.Errorf("cancel: recovery home: %w", err)
 		}

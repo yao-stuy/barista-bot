@@ -48,6 +48,122 @@ const (
 	clawPoseCupObserve              = "cup_observe"
 )
 
+// requiredPose pairs a switch pose name with the component (pose switch) it
+// must resolve on. The component string matches the names accepted by
+// switchForComponent ("filter" / "coffee-claws-middle"). Used by
+// validateConfiguredPoses.
+type requiredPose struct {
+	component string
+	poseName  string
+}
+
+// requiredPoses returns the set of switch poses that the currently-enabled
+// configuration can drive the arm to. The core brew cycle (grind → tamp →
+// lock → release → brew → grab → unlock → home) always runs, so its poses are
+// always required. Cleaning poses are likewise always included: the
+// cancel-recovery path in cancel() runs cleanPortafilter whenever the
+// portafilter holds grounds, which is the case for every order once grinding
+// starts. Optional features (decaf, cup placement/serving, dynamic pickup)
+// contribute their poses only when their config flag is set.
+func (s *beanjaminCoffee) requiredPoses() []requiredPose {
+	poses := []requiredPose{
+		// step 1: grind (regular)
+		{"filter", filterPoseGrinderApproach},
+		{"filter", filterPoseGrinderActivate},
+		// step 2: tamp
+		{"filter", filterPoseTamperApproach},
+		{"filter", filterPoseTamperActivate},
+		// step 3: lock portafilter
+		{"filter", filterPoseCoffeeApproach},
+		{"filter", filterPoseCoffeeIn},
+		{"filter", filterPoseCoffeeLockedFinal},
+		// step 4: release filter
+		{"coffee-claws-middle", clawPoseFilterReleased},
+		// step 6: brew (coffee button on/off)
+		{"coffee-claws-middle", clawPoseCoffeeButtonApproach},
+		{"coffee-claws-middle", clawPoseCoffeeButtonOn},
+		{"coffee-claws-middle", clawPoseCoffeeButtonOff},
+		// step 7: grab filter
+		{"coffee-claws-middle", clawPoseCoffeeLockedFinal},
+		// step 8: unlock portafilter (adds the shake pose to the lock poses)
+		{"filter", filterPoseCoffeeShake},
+		// step 9: home
+		{"filter", filterPoseHome},
+		// cleaning (clean_after_use + cancel recovery)
+		{"filter", filterPoseCloseToCleaning},
+		{"filter", filterPoseApproachToCleaningScrapper},
+		{"filter", filterPoseCleaningScrapperActive},
+		{"filter", filterPoseApproachToCleaningBrush},
+		{"filter", filterPoseCleaningBrushActive},
+	}
+
+	if s.cfg.CanServeDecaf {
+		poses = append(poses,
+			requiredPose{"filter", filterPoseDecafGrinderApproach},
+			requiredPose{"filter", filterPoseDecafGrinderActivate},
+		)
+	}
+
+	if s.cfg.PlaceCup {
+		// setCupForCoffee always seats the cup under the machine.
+		poses = append(poses,
+			requiredPose{"coffee-claws-middle", clawPoseCupUnderMachineApproach},
+			requiredPose{"coffee-claws-middle", clawPoseCupReadyForCoffee},
+		)
+		if s.cfg.DynamicCupPickup {
+			// pickCupDynamic observes from cup_observe plus any alternates.
+			poses = append(poses, requiredPose{"coffee-claws-middle", clawPoseCupObserve})
+			for _, name := range s.cfg.CupObserveAlternates {
+				poses = append(poses, requiredPose{"coffee-claws-middle", name})
+			}
+		} else {
+			// Static pickup grabs from the fixed empty-cup poses.
+			poses = append(poses,
+				requiredPose{"coffee-claws-middle", clawPoseEmptyCupApproach},
+				requiredPose{"coffee-claws-middle", clawPoseEmptyCup},
+			)
+		}
+		// Serving: placeFullCupOnShelf composes world poses at runtime (no
+		// named pose to validate); giveFullCupToCustomer hands the cup back
+		// via the empty-cup poses.
+		if !s.cfg.PlaceCupOnShelf {
+			poses = append(poses,
+				requiredPose{"coffee-claws-middle", clawPoseEmptyCupApproach},
+				requiredPose{"coffee-claws-middle", clawPoseEmptyCup},
+			)
+		}
+	}
+
+	return poses
+}
+
+// validateConfiguredPoses checks, for the currently-enabled configuration,
+// that every switch pose the service can move to actually resolves on its pose
+// switch and is non-zero. A missing pose surfaces as a get_pose_by_name error
+// from the switch; an all-zero translation indicates an unset/placeholder pose
+// that would silently drive the arm to the base origin. Called once at
+// construction so a misconfigured switch fails fast instead of mid-order.
+func (s *beanjaminCoffee) validateConfiguredPoses(ctx context.Context) error {
+	seen := make(map[string]bool)
+	for _, rp := range s.requiredPoses() {
+		key := rp.component + "/" + rp.poseName
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		pd, err := s.fetchPose(ctx, rp.component, rp.poseName)
+		if err != nil {
+			return fmt.Errorf("pose validation: required pose %q on %q switch: %w", rp.poseName, rp.component, err)
+		}
+		if pd.pose.Point() == (r3.Vector{}) {
+			return fmt.Errorf("pose validation: required pose %q on %q switch resolves to a zero position — is it configured?", rp.poseName, rp.component)
+		}
+	}
+	s.logger.Infof("pose validation: %d configured pose(s) resolved and non-zero", len(seen))
+	return nil
+}
+
 // say queues text for the speech service when conversational mode is
 // enabled, otherwise no-ops. Use this for status-narrating lines (greetings,
 // progress prompts, rejections) that an external orchestrator may want to
