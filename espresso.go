@@ -276,6 +276,21 @@ func isDecafDrink(drink string) bool {
 	return drink == "decaf" || drink == "decaf_lungo"
 }
 
+// isLungoDrink reports whether the drink is a lungo-size pour, matching the
+// lungo cases in drinkBrewTime.
+func isLungoDrink(drink string) bool {
+	return drink == "lungo" || drink == "decaf_lungo"
+}
+
+// waterDelta returns the water-usage increment for a brew: 1.5 for lungo sizes
+// (lungo/decaf_lungo), 1 otherwise (espresso/decaf).
+func waterDelta(drink string) float64 {
+	if isLungoDrink(drink) {
+		return 1.5
+	}
+	return 1
+}
+
 func (s *beanjaminCoffee) prepareDrink(ctx context.Context, drink, customerName string, batchIndex, batchSize int) (err error) {
 	ctx, span := trace.StartSpan(ctx, "beanjamin::prepareDrink["+drink+"]")
 	defer span.End()
@@ -313,6 +328,7 @@ func (s *beanjaminCoffee) prepareDrink(ctx context.Context, drink, customerName 
 		if err != nil {
 			return err
 		}
+		s.incrementSensorReading(ctx, s.usageSensor, "decaf grinder", "decaf_grinds", 1)
 	} else {
 		s.logger.Infof("step 1/9: grinding coffee")
 		ctx, stepSpan := trace.StartSpan(ctx, "beanjamin::step::grinding")
@@ -321,6 +337,7 @@ func (s *beanjaminCoffee) prepareDrink(ctx context.Context, drink, customerName 
 		if err != nil {
 			return err
 		}
+		s.incrementSensorReading(ctx, s.usageSensor, "grinder", "regular_grinds", 1)
 	}
 
 	s.setStep(stepTamping)
@@ -381,6 +398,7 @@ func (s *beanjaminCoffee) prepareDrink(ctx context.Context, drink, customerName 
 		if err != nil {
 			return err
 		}
+		s.incrementSensorReading(ctx, s.usageSensor, "water", "usage", waterDelta(drink))
 	}
 
 	if s.cfg.PlaceCup {
@@ -442,6 +460,7 @@ func (s *beanjaminCoffee) prepareDrink(ctx context.Context, drink, customerName 
 		if err != nil {
 			return err
 		}
+		s.incrementSensorReading(ctx, s.usageSensor, "cleaner", "cleanings", 1)
 	} else {
 		s.logger.Infof("post: skipping cleaning (clean_after_use=false)")
 	}

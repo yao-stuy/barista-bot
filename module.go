@@ -88,6 +88,11 @@ type Config struct {
 	SaveMotionRequestsDir     string  `json:"save_motion_requests_dir,omitempty"`
 	OrderSensorName           string  `json:"order_sensor_name,omitempty"`
 
+	// Optional usage sensor updated during the brew lifecycle via a best-effort
+	// read-modify-write: each counter is read with Readings and written back
+	// with DoCommand({"set": {<key>: <value>}}).
+	UsageSensorName string `json:"usage_sensor_name,omitempty"`
+
 	CamStorageMuxName string `json:"cam_storage_mux_name,omitempty"`
 	DataDir           string `json:"data_dir,omitempty"`
 	CanServeDecaf     bool   `json:"can_serve_decaf,omitempty"`
@@ -219,6 +224,9 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.OrderSensorName != "" {
 		optDeps = append(optDeps, sensor.Named(cfg.OrderSensorName).String())
 	}
+	if cfg.UsageSensorName != "" {
+		optDeps = append(optDeps, sensor.Named(cfg.UsageSensorName).String())
+	}
 	if cfg.CamStorageMuxName != "" {
 		optDeps = append(optDeps, generic.Named(cfg.CamStorageMuxName).String())
 	}
@@ -307,9 +315,14 @@ type beanjaminCoffee struct {
 	// the filter doesn't get stranded with grounds in it.
 	portafilterHasGrounds atomic.Bool
 	orderSensorSink       orderSensorSink // optional; named order-sensor from deps, nil if unset
-	cupVision             vision.Service  // optional; nil when DynamicCupPickup=false
-	cupCameraName         string          // SrcCameraName, validated to exist in cachedFS
-	servedShelfTile       atomic.Value    // servedShelfTile holds the latest servedShelfTilePick chosen by
+	// Optional usage sensor updated during the brew lifecycle (sensor_usage.go).
+	// nil when usage_sensor_name is unset, in which case every update is a
+	// no-op. Holds all counters keyed by regular_grinds, decaf_grinds, usage,
+	// cleanings, and successful_consecutive_orders.
+	usageSensor     sensor.Sensor
+	cupVision       vision.Service // optional; nil when DynamicCupPickup=false
+	cupCameraName   string         // SrcCameraName, validated to exist in cachedFS
+	servedShelfTile atomic.Value   // servedShelfTile holds the latest servedShelfTilePick chosen by
 }
 
 func newBeanjaminCoffee(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -451,6 +464,19 @@ func NewCoffee(ctx context.Context, deps resource.Dependencies, name resource.Na
 		logger.Infof("order sensor %q connected", conf.OrderSensorName)
 	}
 
+	// Optional usage sensor. Resolve to the same component instance on the
+	// robot; a configured-but-unresolvable name fails construction to surface
+	// misconfiguration early (an unset name simply stays nil).
+	var usageSensor sensor.Sensor
+	if conf.UsageSensorName != "" {
+		usageSensor, err = sensor.FromProvider(deps, conf.UsageSensorName)
+		if err != nil {
+			cancelFunc()
+			return nil, fmt.Errorf("usage_sensor_name %q: %w", conf.UsageSensorName, err)
+		}
+		logger.Infof("usage sensor %q connected", conf.UsageSensorName)
+	}
+
 	s := &beanjaminCoffee{
 		name:                 name,
 		logger:               logger,
@@ -470,6 +496,7 @@ func NewCoffee(ctx context.Context, deps resource.Dependencies, name resource.Na
 		queue:                NewOrderQueue(),
 		queueStop:            make(chan struct{}),
 		orderSensorSink:      sink,
+		usageSensor:          usageSensor,
 		cupVision:            cupVision,
 		cupCameraName:        cupCameraName,
 	}
