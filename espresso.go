@@ -749,7 +749,6 @@ func (s *beanjaminCoffee) cleanPortafilter(ctx, cancelCtx context.Context) error
 		{PoseName: "cleaning_brush_active", Component: "filter", LinearConstraint: defaultApproachConstraint, AllowedCollisions: cleaningCollisions},
 		{PoseName: "cleaning_brush_active", Component: "filter", AllowedCollisions: cleaningCollisions, CircularRadiusMm: 3, CircularDurationSec: 2.5, CircularPointsPerRev: 8},
 		{PoseName: "approach_to_cleaning_brush", Component: "filter", LinearConstraint: defaultApproachConstraint, AllowedCollisions: cleaningCollisions, Pause: shortPause},
-		{PoseName: "approach_to_cleaning_scrapper", Component: "filter", LinearConstraint: defaultApproachConstraint, AllowedCollisions: cleaningCollisions, Pause: shortPause},
 		{PoseName: "close_to_cleaning", Component: "filter", AllowedCollisions: cleaningCollisions, Pause: shortPause},
 	}
 	for _, step := range steps {
