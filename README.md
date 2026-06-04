@@ -216,6 +216,16 @@ Orchestrates a full coffee brew cycle using a `multi-poses-execution-switch` com
 
 Add a **`viam:beanjamin:order-sensor`** component to the machine, put it in the coffee service **depends_on**, and set `order_sensor_name` to that component’s name. When an order attempt finishes, one reading is queued with `start_time`, `end_time`, `order_ok`, `duration_ms`, and — for observability — `failed_step`, `operator_cancelled`, `trace_id`, the path flags (`place_cup`/`clean_after_use`/`decaf`), and `error_message` (if applicable).
 
+**Usage sensor.** The optional `usage_sensor_name` field points at a single sensor resource that holds several counters, one per key, updated through the brew lifecycle. Setting the field automatically registers the sensor as a dependency of the coffee service, so no manual `depends_on` entry is required. The sensor must support both the `Readings` API and a `DoCommand({"set": {<key>: <value>}})` that overwrites the named counter (and preserves the others). The coffee service updates each counter with a best-effort read-modify-write: it reads the current value via `Readings`, computes the new value, and writes it back via `DoCommand`. The keys are:
+
+- `regular_grinds` — +1 after each regular (non-decaf) grind
+- `decaf_grinds` — +1 after each decaf grind
+- `usage` — +1 after a regular brew (espresso/decaf), +1.5 after a lungo brew (lungo/decaf_lungo)
+- `cleanings` — +1 after each cleaning cycle
+- `successful_consecutive_orders` — +1 after each successful order, reset to 0 after any failed **or** operator-cancelled order
+
+Consumable counters increment only after their step completes successfully, so a brew that fails partway leaves the consumables it actually used counted and does not roll them back. A missing counter key is treated as 0 (so the first update lands a fresh count). All updates are best-effort: a read/write failure logs a warning and never fails the brew. When `usage_sensor_name` is unset, every update is skipped.
+
 Configure a [`viam:video:storage`](https://github.com/viam-modules/video-store) camera on the machine. After each order attempt, the coffee service issues an async `save` DoCommand. Each clip includes a fixed **N seconds** of pre-roll (ring-buffer permitting) and **N seconds** of post-roll; the short post-roll wait means the next queued order starts slightly after the prior one fully finishes.
 
 The save request includes a `tags` entry with the order UUID (for cloud data filtering) and JSON `metadata` with order and customer fields. Clips are queued after every attempt, including failed brews or panics; failures set `order_status` to `failed` and include an `error` string.
@@ -239,6 +249,7 @@ The save request includes a `tags` entry with the order UUID (for cloud data fil
 | `portafilter_shake_sec`    | float  | No       | Duration in seconds of a small circular shake at the `coffee_shake` pose during `unlock_portafilter`, to dislodge a stuck puck. Requires a `coffee_shake` pose in the filter pose switcher. Defaults to 0 (disabled). |
 | `save_motion_requests_dir` | string | No       | Directory to save motion request payloads for debugging.                                                      |
 | `order_sensor_name`        | string | No       | Name of a `viam:beanjamin:order-sensor` sensor to notify when each order attempt completes (must appear in **depends_on**). |
+| `usage_sensor_name`        | string | No       | Name of a single sensor whose per-key counters are updated through the brew lifecycle: `regular_grinds`, `decaf_grinds`, `usage`, `cleanings`, and `successful_consecutive_orders`. See "Usage sensor" below. |
 | `cam_storage_mux_name` | string | No   | Name of a [`viam:multiplexer:resource-multiplexer`](https://github.com/viam-modules/multiplexer) generic service whose dependencies are `viam:video:storage` stores; when set, uploads a clip per order attempt (async `save`) to all configured stores. |
 | `data_dir`                 | string | No       | Directory for persistent module data. When set alongside `cam_storage_mux_name`, pending-clip records are written under `<data_dir>/pending-clips` when each order starts and removed on completion; use with a Viam scheduled job calling `cleanup_pending_clips` to recover clips from interrupted orders. |
 | `input_range_override`     | object | No       | Narrows joint limits on named frames before motion planning. Outer key is the frame name (typically the arm); inner key is either the joint name or its stringified index (e.g. `"5"` for the last joint of a 6-DoF arm). Each value is `{ "min_degs": number, "max_degs": number }`. |
@@ -246,25 +257,25 @@ The save request includes a `tags` entry with the order UUID (for cloud data fil
 | `dynamic_cup_pickup`                  | bool   | No       | Enables vision-guided cup pickup. When `true`, the arm uses a vision service to detect cups in the workspace rather than picking from the static `empty_cup` pose. Default `false`. |
 | `cup_vision_service_name`             | string | When `dynamic_cup_pickup` is enabled | Name of a `rdk:service:vision` segmenter that returns cup detections via `GetObjectPointClouds`. |
 | `src_camera_name`                     | string | When `dynamic_cup_pickup` is enabled | Source camera the vision service segments from. Must be present in the frame system. |
+| `camera_observe_pose_switcher_name`   | string | When `dynamic_cup_pickup` is enabled | Switcher holding the camera observation vantages. Every pose is visited and vision run at each; detections merge in the world frame (near-duplicates within 40 mm collapsed). Must include a pose named `cup_observe` (the home/recovery pose), and all poses must move the `cam` frame (set the switch's `component_name` to `cam`) |
 | `expected_cup_position_mm`            | object | When `dynamic_cup_pickup` is enabled | World-frame heuristic point `{ "x": number, "y": number, "z": number }`. The detection closest to this point wins. |
 | `cup_approach_relative_pose`          | object | When `dynamic_cup_pickup` is enabled | 6-DoF offset composed onto the detected cup centroid for the pre-grab pose. Shape `{ "x", "y", "z", "o_x", "o_y", "o_z", "theta" }`; same gripper orientation as the grab pose but translated further back from the cup. **Not** stored on the pose switch — it's an offset, not a real world-frame pose. |
 | `cup_grab_relative_pose`              | object | When `dynamic_cup_pickup` is enabled | 6-DoF offset composed onto the detected cup centroid for the final grab pose. Same shape as `cup_approach_relative_pose`; gripper orientation for a side-grab with a small translation onto the cup. |
 | `cup_max_distance_from_target_mm`     | float  | No       | Hard cutoff: detections beyond this distance from `expected_cup_position_mm` are dropped. Default 300 mm. |
-| `cup_detection_retries`               | int    | No       | Number of additional vision calls if a given vantage returns 0 detections. Applied per pass when `cup_observe_alternates` is set. Default 0. |
-| `cup_detection_retry_sleep_ms`        | int    | No       | Sleep between detection retries in milliseconds. Default 250. |
-| `cup_observe_alternates`              | string[] | No     | Optional list of named poses on the claws pose switch visited in order after `cup_observe` to widen detection coverage. The arm runs vision at `cup_observe`, then drives to each alternate and runs vision again. Detections are merged in world frame with near-duplicates (within 40 mm) collapsed before pickup ranking and shelf-tile selection. An unreachable pose logs a warning and skips that pass — partial multi-vantage data still gets used. Empty (default) = single observation at `cup_observe`. Use 1–3 alternates (e.g. yawed left, yawed right, closer + more level) to mitigate single-frame YOLO misses and shelf-cup occlusion. |
+| `cup_photos_per_vantage`              | int    | No       | How many vision frames to capture at each observation pose. Every detection from every frame feeds the cross-vantage merge. Default 1. |
 | `cup_pickup_max_attempts`             | int    | No       | Cap on full observe-and-grab attempts per order. Each attempt re-detects and walks the candidate list (closest first), falling through to the next candidate on planning failures and re-observing once the batch is exhausted. Default 3. |
 | `cup_centroid_min_z_mm`               | float  | No       | Minimum world-frame Z for each detection. If a detected centroid's Z is below this, it is clamped up to this value before pose composition; values above are left alone. Use to recover from depth noise that would otherwise produce a too-low approach pose and trip the planner. Default `0` disables clamping. |
 | `place_cup_on_shelf`                  | bool   | No       | When `true`, replaces the per-customer handoff with placement on a dedicated served-drinks shelf. Tile centers are tiled along the shelf's long axis (120 mm spacing, 60 mm margin from each end) on the midline of the shelf top; the placement anchor is 40 mm above the shelf top surface (composed with `cup_grab_relative_pose` to derive the actual claws pose, mirroring how the pickup uses the detected cup centroid). At observation time during pickup, detections are partitioned by world-frame Z relative to the shelf top: detections **above** the surface are treated as already-served cups (used to mark tiles as occupied; excluded from pickup ranking), and detections **at or below** the surface are pickup candidates. The first tile whose center point has no on-shelf cup within an 80 mm collision buffer is chosen. Requires `dynamic_cup_pickup=true`, a `shelf-top` (or `shelf-top_origin`) Box geometry in the framesystem, and a shelf physically mounted above the empty-cup pickup spot. The `cup_observe` camera view must cover both the pickup area and the shelf top. Default `false`. |
 | `max_batch_size`           | int    | No       | Cap on `prepare_order.count` — how many identical drinks one DoCommand may enqueue at once. Defaults to 10 when unset. Protects the queue against runaway voice commands or LLM hallucinations. |
 
-**Dynamic cup pickup — required pose on the claws pose switcher (`claws_pose_switcher_name`):**
+**Dynamic cup pickup — required poses on the camera-observe pose switcher (`camera_observe_pose_switcher_name`):**
 
-When `dynamic_cup_pickup` is enabled, one additional named pose must exist on the claws pose switch:
+When `dynamic_cup_pickup` is enabled, the dedicated camera-observe switch must hold one or more observation poses, all moving the camera frame `cam` (the switch's `component_name`). The switch must include a pose named `cup_observe`.
 
 | Pose name           | Type                | Description |
 | ------------------- | ------------------- | ----------- |
-| `cup_observe`       | Absolute world pose | Arm moves here before querying the vision service to get a clear view of the cup workspace. |
+| `cup_observe`       | Absolute world pose | Required. The primary view of the cup workspace and the home/recovery pose the arm returns to between grab attempts. |
+| additional poses    | Absolute world pose | Optional extra vantages swept to widen coverage and see cups occluded from the primary view. An unreachable pose logs a warning and is skipped. |
 
 ### DoCommand
 
@@ -341,6 +352,16 @@ Returns `{"saved": 1, "skipped": 0}`.
 ```
 
 Returns `{"status": "reset", "cancelled": true, "cleared": 2, "unpaused": true}` — fields reflect which steps actually fired.
+
+**`run_cup_flow`** - Exercise the full cup-handling path without brewing, `count` times. Each iteration observes every camera-observe vantage (multiple photos merged), picks the closest empty cup, sets it under the machine, retrieves it, and places it on the next free served-shelf tile. Because it re-observes at the start of every iteration, each placement accounts for the cups left by previous iterations. Intended for tuning multi-vantage detection and shelf placement on hardware.
+
+Requires `dynamic_cup_pickup=true` and `place_cup_on_shelf=true`. Assumes the portafilter has been **physically removed** from the claws — the flow never touches portafilter state. Honors `cancel`. The value is the iteration count (`>= 1`); `true` runs a single iteration.
+
+```json
+{"run_cup_flow": 5}
+```
+
+Returns `{"status": "complete", "iterations": 5}`.
 
 **`action`** - Control the gripper. Supported values: `"open_gripper"`, `"close_gripper"`.
 

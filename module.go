@@ -88,6 +88,11 @@ type Config struct {
 	SaveMotionRequestsDir     string  `json:"save_motion_requests_dir,omitempty"`
 	OrderSensorName           string  `json:"order_sensor_name,omitempty"`
 
+	// Optional usage sensor updated during the brew lifecycle via a best-effort
+	// read-modify-write: each counter is read with Readings and written back
+	// with DoCommand({"set": {<key>: <value>}}).
+	UsageSensorName string `json:"usage_sensor_name,omitempty"`
+
 	CamStorageMuxName string `json:"cam_storage_mux_name,omitempty"`
 	DataDir           string `json:"data_dir,omitempty"`
 	CanServeDecaf     bool   `json:"can_serve_decaf,omitempty"`
@@ -104,19 +109,15 @@ type Config struct {
 	// Dynamic cup pickup. When true, setCupForCoffee uses vision-driven
 	// detection to find the cup; when false, the existing static pickup
 	// (empty_cup_approach -> empty_cup) is used.
-	DynamicCupPickup           bool          `json:"dynamic_cup_pickup,omitempty"`
-	CupVisionServiceName       string        `json:"cup_vision_service_name,omitempty"`
-	SrcCameraName              string        `json:"src_camera_name,omitempty"`
-	ExpectedCupPositionMm      *Vec3Mm       `json:"expected_cup_position_mm,omitempty"`
-	CupApproachRelativePose    *RelativePose `json:"cup_approach_relative_pose,omitempty"`
-	CupGrabRelativePose        *RelativePose `json:"cup_grab_relative_pose,omitempty"`
-	CupMaxDistanceFromTargetMm float64       `json:"cup_max_distance_from_target_mm,omitempty"`
-	CupDetectionRetries        int           `json:"cup_detection_retries,omitempty"`
-	CupDetectionRetrySleepMs   int           `json:"cup_detection_retry_sleep_ms,omitempty"`
-	// CupObserveAlternates are additional named poses on the claws pose
-	// switch visited in order after cup_observe to widen detection
-	// coverage. Each entry must exist on claws_pose_switcher_name.
-	CupObserveAlternates []string `json:"cup_observe_alternates,omitempty"`
+	DynamicCupPickup              bool          `json:"dynamic_cup_pickup,omitempty"`
+	CupVisionServiceName          string        `json:"cup_vision_service_name,omitempty"`
+	SrcCameraName                 string        `json:"src_camera_name,omitempty"`
+	ExpectedCupPositionMm         *Vec3Mm       `json:"expected_cup_position_mm,omitempty"`
+	CupApproachRelativePose       *RelativePose `json:"cup_approach_relative_pose,omitempty"`
+	CupGrabRelativePose           *RelativePose `json:"cup_grab_relative_pose,omitempty"`
+	CupMaxDistanceFromTargetMm    float64       `json:"cup_max_distance_from_target_mm,omitempty"`
+	CupPhotosPerVantage           int           `json:"cup_photos_per_vantage,omitempty"`
+	CameraObservePoseSwitcherName string        `json:"camera_observe_pose_switcher_name,omitempty"`
 	// CupPickupMaxAttempts caps how many full observe-and-grab attempts
 	// pickCupDynamic will make per order. Each attempt re-detects, then
 	// walks the candidate list (closest first), falling through to the
@@ -172,6 +173,15 @@ func (s *beanjaminCoffee) cupPickupMaxAttempts() int {
 	return defaultCupPickupMaxAttempts
 }
 
+// cupPhotosPerVantage returns the number of vision frames to capture at each
+// observation pose, defaulting to 1.
+func (s *beanjaminCoffee) cupPhotosPerVantage() int {
+	if s.cfg != nil && s.cfg.CupPhotosPerVantage > 1 {
+		return s.cfg.CupPhotosPerVantage
+	}
+	return 1
+}
+
 // Vec3Mm is a 3D point in millimeters used for world-frame configuration.
 type Vec3Mm struct {
 	X float64 `json:"x"`
@@ -219,6 +229,9 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.OrderSensorName != "" {
 		optDeps = append(optDeps, sensor.Named(cfg.OrderSensorName).String())
 	}
+	if cfg.UsageSensorName != "" {
+		optDeps = append(optDeps, sensor.Named(cfg.UsageSensorName).String())
+	}
 	if cfg.CamStorageMuxName != "" {
 		optDeps = append(optDeps, generic.Named(cfg.CamStorageMuxName).String())
 	}
@@ -230,6 +243,9 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		if cfg.SrcCameraName == "" {
 			return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "src_camera_name")
 		}
+		if cfg.CameraObservePoseSwitcherName == "" {
+			return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "camera_observe_pose_switcher_name")
+		}
 		if cfg.ExpectedCupPositionMm == nil {
 			return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "expected_cup_position_mm")
 		}
@@ -239,16 +255,11 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		if cfg.CupGrabRelativePose == nil {
 			return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "cup_grab_relative_pose")
 		}
-		if cfg.CupDetectionRetries < 0 {
-			return nil, nil, fmt.Errorf("%s: cup_detection_retries must be >= 0", path)
+		if cfg.CupPhotosPerVantage < 0 {
+			return nil, nil, fmt.Errorf("%s: cup_photos_per_vantage must be >= 0", path)
 		}
 		if cfg.CupPickupMaxAttempts < 0 {
 			return nil, nil, fmt.Errorf("%s: cup_pickup_max_attempts must be >= 0", path)
-		}
-		for i, name := range cfg.CupObserveAlternates {
-			if name == "" {
-				return nil, nil, fmt.Errorf("%s: cup_observe_alternates[%d] is empty", path, i)
-			}
 		}
 		if cfg.CupMaxDistanceFromTargetMm == 0 {
 			cfg.CupMaxDistanceFromTargetMm = 300
@@ -256,6 +267,7 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		reqDeps = append(reqDeps,
 			vision.Named(cfg.CupVisionServiceName).String(),
 			camera.Named(cfg.SrcCameraName).String(),
+			cfg.CameraObservePoseSwitcherName,
 		)
 	}
 
@@ -274,6 +286,7 @@ type beanjaminCoffee struct {
 	cfg                    *Config
 	filterSw               toggleswitch.Switch
 	clawsSw                toggleswitch.Switch
+	cameraObserveSw        toggleswitch.Switch // optional; nil unless DynamicCupPickup. Holds the camera observation vantages.
 	arm                    arm.Arm
 	fsSvc                  framesystem.Service
 	cachedFS               *referenceframe.FrameSystem // cached frame system, mutated at lock/unlock
@@ -307,9 +320,14 @@ type beanjaminCoffee struct {
 	// the filter doesn't get stranded with grounds in it.
 	portafilterHasGrounds atomic.Bool
 	orderSensorSink       orderSensorSink // optional; named order-sensor from deps, nil if unset
-	cupVision             vision.Service  // optional; nil when DynamicCupPickup=false
-	cupCameraName         string          // SrcCameraName, validated to exist in cachedFS
-	servedShelfTile       atomic.Value    // servedShelfTile holds the latest servedShelfTilePick chosen by
+	// Optional usage sensor updated during the brew lifecycle (sensor_usage.go).
+	// nil when usage_sensor_name is unset, in which case every update is a
+	// no-op. Holds all counters keyed by regular_grinds, decaf_grinds, usage,
+	// cleanings, and successful_consecutive_orders.
+	usageSensor     sensor.Sensor
+	cupVision       vision.Service // optional; nil when DynamicCupPickup=false
+	cupCameraName   string         // SrcCameraName, validated to exist in cachedFS
+	servedShelfTile atomic.Value   // servedShelfTile holds the latest servedShelfTilePick chosen by
 }
 
 func newBeanjaminCoffee(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -376,6 +394,7 @@ func NewCoffee(ctx context.Context, deps resource.Dependencies, name resource.Na
 
 	var cupVision vision.Service
 	var cupCameraName string
+	var cameraObserveSw toggleswitch.Switch
 	if conf.DynamicCupPickup {
 		visRes, err := vision.FromProvider(deps, conf.CupVisionServiceName)
 		if err != nil {
@@ -388,7 +407,19 @@ func NewCoffee(ctx context.Context, deps resource.Dependencies, name resource.Na
 			return nil, fmt.Errorf("src_camera_name %q not found in frame system — add the camera to the frame system fragment", conf.SrcCameraName)
 		}
 		cupCameraName = conf.SrcCameraName
-		logger.Infof("dynamic cup pickup enabled (vision=%q, camera=%q)", conf.CupVisionServiceName, conf.SrcCameraName)
+
+		obsSwRes, ok := deps[toggleswitch.Named(conf.CameraObservePoseSwitcherName)]
+		if !ok {
+			cancelFunc()
+			return nil, fmt.Errorf("camera observe switch %q not found in dependencies", conf.CameraObservePoseSwitcherName)
+		}
+		cameraObserveSw, ok = obsSwRes.(toggleswitch.Switch)
+		if !ok {
+			cancelFunc()
+			return nil, fmt.Errorf("resource %q is not a switch", conf.CameraObservePoseSwitcherName)
+		}
+		logger.Infof("dynamic cup pickup enabled (vision=%q, camera=%q, observe_switch=%q)",
+			conf.CupVisionServiceName, conf.SrcCameraName, conf.CameraObservePoseSwitcherName)
 	}
 
 	var speech resource.Resource
@@ -451,12 +482,26 @@ func NewCoffee(ctx context.Context, deps resource.Dependencies, name resource.Na
 		logger.Infof("order sensor %q connected", conf.OrderSensorName)
 	}
 
+	// Optional usage sensor. Resolve to the same component instance on the
+	// robot; a configured-but-unresolvable name fails construction to surface
+	// misconfiguration early (an unset name simply stays nil).
+	var usageSensor sensor.Sensor
+	if conf.UsageSensorName != "" {
+		usageSensor, err = sensor.FromProvider(deps, conf.UsageSensorName)
+		if err != nil {
+			cancelFunc()
+			return nil, fmt.Errorf("usage_sensor_name %q: %w", conf.UsageSensorName, err)
+		}
+		logger.Infof("usage sensor %q connected", conf.UsageSensorName)
+	}
+
 	s := &beanjaminCoffee{
 		name:                 name,
 		logger:               logger,
 		cfg:                  conf,
 		filterSw:             filterSw,
 		clawsSw:              clawSw,
+		cameraObserveSw:      cameraObserveSw,
 		arm:                  armComp,
 		fsSvc:                fsSvc,
 		cachedFS:             cachedFS,
@@ -470,6 +515,7 @@ func NewCoffee(ctx context.Context, deps resource.Dependencies, name resource.Na
 		queue:                NewOrderQueue(),
 		queueStop:            make(chan struct{}),
 		orderSensorSink:      sink,
+		usageSensor:          usageSensor,
 		cupVision:            cupVision,
 		cupCameraName:        cupCameraName,
 	}
@@ -566,6 +612,24 @@ func (s *beanjaminCoffee) Status(ctx context.Context) (map[string]interface{}, e
 	return resp, nil
 }
 
+// parseCupFlowCount extracts the iteration count from a run_cup_flow command
+// value. A JSON number is the count; bool true means a single iteration.
+func parseCupFlowCount(v interface{}) (int, error) {
+	count := 1
+	switch n := v.(type) {
+	case bool:
+		// run_cup_flow: true → one iteration.
+	case float64:
+		count = int(n)
+	default:
+		return 0, fmt.Errorf("run_cup_flow must be an iteration count (number) or true, got %T", v)
+	}
+	if count < 1 {
+		return 0, fmt.Errorf("run_cup_flow count must be >= 1, got %d", count)
+	}
+	return count, nil
+}
+
 func (s *beanjaminCoffee) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	ctx, span := trace.StartSpan(ctx, "beanjamin::DoCommand")
 	defer span.End()
@@ -626,6 +690,20 @@ func (s *beanjaminCoffee) DoCommand(ctx context.Context, cmd map[string]interfac
 		}
 		return res, err
 	}
+	if countRaw, ok := cmd["run_cup_flow"]; ok {
+		ctx, cmdSpan := trace.StartSpan(ctx, "beanjamin::run_cup_flow")
+		defer cmdSpan.End()
+		count, err := parseCupFlowCount(countRaw)
+		if err != nil {
+			s.logger.Errorw("DoCommand", "error", err)
+			return nil, err
+		}
+		res, err := s.runCupFlow(ctx, count)
+		if err != nil {
+			s.logger.Errorw("DoCommand", "error", err)
+		}
+		return res, err
+	}
 	// Stream deck key commands
 	if action, ok := cmd["action"].(string); ok {
 		ctx, cmdSpan := trace.StartSpan(ctx, "beanjamin::action["+action+"]")
@@ -639,7 +717,7 @@ func (s *beanjaminCoffee) DoCommand(ctx context.Context, cmd map[string]interfac
 			return nil, fmt.Errorf("unknown action %q", action)
 		}
 	}
-	err := fmt.Errorf("unknown command, supported commands: cancel, prepare_order, execute_action, get_queue, proceed, clear_queue, cleanup_pending_clips, reset_world, action")
+	err := fmt.Errorf("unknown command, supported commands: cancel, prepare_order, execute_action, get_queue, proceed, clear_queue, cleanup_pending_clips, reset_world, run_cup_flow, action")
 	s.logger.Warnw("DoCommand", "error", err)
 	return nil, err
 }
