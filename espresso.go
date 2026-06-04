@@ -45,7 +45,10 @@ const (
 	clawPoseEmptyCup                = "empty_cup"
 	clawPoseCupReadyForCoffee       = "cup_ready_for_coffee"
 	clawPoseCupUnderMachineApproach = "cup_under_machine_approach"
-	clawPoseCupObserve              = "cup_observe"
+
+	// camera pose switches (extra vantages live on
+	// the same switch and are enumerated at runtime).
+	camPoseCupObserve = "cup_observe"
 )
 
 const (
@@ -53,6 +56,7 @@ const (
 	// AllowedCollision frame names.
 	componentFilter = "filter"
 	componentClaws  = "coffee-claws-middle"
+	componentCam    = "cam"
 )
 
 // requiredPose pairs a switch pose name with the component (pose switch) it
@@ -118,11 +122,10 @@ func (s *beanjaminCoffee) requiredPoses() []requiredPose {
 			requiredPose{componentClaws, clawPoseCupReadyForCoffee},
 		)
 		if s.cfg.DynamicCupPickup {
-			// pickCupDynamic observes from cup_observe plus any alternates.
-			poses = append(poses, requiredPose{componentClaws, clawPoseCupObserve})
-			for _, name := range s.cfg.CupObserveAlternates {
-				poses = append(poses, requiredPose{componentClaws, name})
-			}
+			// pickCupDynamic observes from the camera-observe switch. The extra
+			// vantages are enumerated at runtime, but cup_observe must exist as
+			// the home/recovery pose.
+			poses = append(poses, requiredPose{componentCam, camPoseCupObserve})
 		} else {
 			// Static pickup grabs from the fixed empty-cup poses.
 			poses = append(poses,
@@ -775,6 +778,57 @@ func (s *beanjaminCoffee) placeFullCupOnShelf(ctx, cancelCtx context.Context) er
 	}
 	time.Sleep(gripperPause)
 	return nil
+}
+
+// runCupFlow exercises the full cup-handling path without brewing: for each of
+// count iterations it dynamically picks a cup, sets it under the machine,
+// retrieves it, and places it on the served shelf. It re-observes (all
+// vantages, all photos, merged) at the start of every iteration, so each
+// placement sees the cups left by previous iterations and picks the next free
+// tile. Intended for tuning multi-vantage detection + shelf placement on
+// hardware.
+//
+// It assumes the portafilter has been physically removed from the claws — the
+// flow never touches portafilter state. Requires dynamic_cup_pickup and
+// place_cup_on_shelf: the shelf tile is selected during each pickup
+// observation and consumed by placeFullCupOnShelf.
+func (s *beanjaminCoffee) runCupFlow(ctx context.Context, count int) (map[string]interface{}, error) {
+	if !s.cfg.DynamicCupPickup {
+		return nil, errors.New("run_cup_flow requires dynamic_cup_pickup=true")
+	}
+	if !s.cfg.PlaceCupOnShelf {
+		return nil, errors.New("run_cup_flow requires place_cup_on_shelf=true")
+	}
+
+	if !s.running.CompareAndSwap(false, true) {
+		return nil, errors.New("a sequence is already running")
+	}
+	defer s.running.Store(false)
+
+	s.mu.Lock()
+	cancelCtx := s.cancelCtx
+	s.mu.Unlock()
+
+	s.logger.Infof("run_cup_flow: starting %d iteration(s) (assumes portafilter physically removed)", count)
+	for i := 1; i <= count; i++ {
+		s.setStep(fmt.Sprintf("Cup flow %d/%d", i, count))
+		s.logger.Infof("run_cup_flow: iteration %d/%d — pick cup + set under machine", i, count)
+		if err := s.setCupForCoffee(ctx, cancelCtx); err != nil {
+			return nil, fmt.Errorf("run_cup_flow: iteration %d/%d: pickup: %w", i, count, err)
+		}
+		s.logger.Infof("run_cup_flow: iteration %d/%d — retrieve from machine + place on shelf", i, count)
+		if err := s.placeFullCupOnShelf(ctx, cancelCtx); err != nil {
+			return nil, fmt.Errorf("run_cup_flow: iteration %d/%d: place-on-shelf: %w", i, count, err)
+		}
+	}
+
+	homeStep := Step{PoseName: "home", Component: "filter"}
+	if err := s.executeStep(ctx, cancelCtx, homeStep); err != nil {
+		return nil, fmt.Errorf("run_cup_flow: home: %w", err)
+	}
+
+	s.logger.Infof("run_cup_flow: complete (%d iteration(s))", count)
+	return map[string]interface{}{"status": "complete", "iterations": count}, nil
 }
 
 func (s *beanjaminCoffee) giveFullCupToCustomer(ctx, cancelCtx context.Context) error {
