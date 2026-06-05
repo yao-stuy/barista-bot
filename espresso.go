@@ -136,7 +136,7 @@ func (s *beanjaminCoffee) requiredPoses() []requiredPose {
 		// Serving: placeFullCupOnShelf composes world poses at runtime (no
 		// named pose to validate); giveFullCupToCustomer hands the cup back
 		// via the empty-cup poses.
-		if !s.cfg.PlaceCupOnShelf {
+		if !s.cfg.PlaceCupInServingArea {
 			poses = append(poses,
 				requiredPose{componentClaws, clawPoseEmptyCupApproach},
 				requiredPose{componentClaws, clawPoseEmptyCup},
@@ -226,7 +226,7 @@ var cupGrabCollisions = []AllowedCollision{
 
 func (s *beanjaminCoffee) executeAction(ctx context.Context, name string) (map[string]interface{}, error) {
 	giveCupFunc := s.giveFullCupToCustomer
-	if s.cfg.PlaceCupOnShelf {
+	if s.cfg.PlaceCupInServingArea {
 		giveCupFunc = s.placeFullCupOnShelf
 	}
 
@@ -406,10 +406,10 @@ func (s *beanjaminCoffee) prepareDrink(ctx context.Context, drink, customerName 
 
 	if s.cfg.PlaceCup {
 		s.setStep(stepServing)
-		s.logger.Infof("step 6b/9: serving cup (place_cup=true, place_cup_on_shelf=%t)", s.cfg.PlaceCupOnShelf)
+		s.logger.Infof("step 6b/9: serving cup (place_cup=true, place_cup_in_serving_area=%t)", s.cfg.PlaceCupInServingArea)
 		ctx, stepSpan := trace.StartSpan(ctx, "beanjamin::step::serving")
 		var err error
-		if s.cfg.PlaceCupOnShelf {
+		if s.cfg.PlaceCupInServingArea {
 			err = s.placeFullCupOnShelf(ctx, cancelCtx)
 		} else {
 			err = s.giveFullCupToCustomer(ctx, cancelCtx)
@@ -697,23 +697,25 @@ func (s *beanjaminCoffee) setCupForCoffee(ctx, cancelCtx context.Context) error 
 }
 
 // placeFullCupOnShelf retrieves the brewed cup from cup_ready_for_coffee and
-// drops it on the served-drinks shelf at the tile chosen earlier by
-// selectShelfTile. Replaces giveFullCupToCustomer when PlaceCupOnShelf=true.
+// drops it on the serving-area shelf. Replaces giveFullCupToCustomer when
+// PlaceCupInServingArea=true.
 //
 // The grab phase mirrors giveFullCupToCustomer (approach -> open -> linear
-// descent + grab -> linear retreat). The placement phase plans to a
-// world-frame approach pose above the chosen tile, descends linearly to the
-// drop pose (claws-middle = shelfTopZ + shelfDropZOffsetMm), opens the
-// gripper to release, then retreats linearly and closes the gripper.
+// descent + grab -> linear retreat). The placement phase walks the serving-area
+// slots in round-robin order starting from servingAreaSlotCounter and drops the
+// cup in the first slot it can reach (tryDropCupInSlot), skipping any whose
+// approach or descent cannot be planned. On success the counter advances to the
+// slot after the one used, so the next placement starts there.
 func (s *beanjaminCoffee) placeFullCupOnShelf(ctx, cancelCtx context.Context) error {
 	if s.gripper == nil {
 		return fmt.Errorf("place_full_cup_on_shelf: no gripper configured")
 	}
 
-	pickRaw := s.servedShelfTile.Load()
-	pick, ok := pickRaw.(servedShelfTilePick)
-	if !ok || !pick.ok {
-		return fmt.Errorf("place_full_cup_on_shelf: no shelf tile selected — selectShelfTile must run during pickup observation")
+	// Resolve the serving-area slot layout up front so a missing/too-small
+	// serving area aborts before any arm motion.
+	slots, shelfTopZ, err := s.servingAreaSlots(ctx)
+	if err != nil {
+		return fmt.Errorf("place_full_cup_on_shelf: %w", err)
 	}
 
 	// 1. Retrieve the brewed cup (mirrors giveFullCupToCustomer).
@@ -738,72 +740,119 @@ func (s *beanjaminCoffee) placeFullCupOnShelf(ctx, cancelCtx context.Context) er
 		return fmt.Errorf("place_full_cup_on_shelf: %w", err)
 	}
 
-	// 2. Compose drop + approach poses in world frame. CupGrabRelativePose is
-	// the same relative offset used at pickup (composed onto the detected
-	// cup centroid) — composing it onto the placement anchor here keeps the
-	// claws-to-cup geometry identical between grab and release, so the cup
-	// lands centered on the chosen tile.
+	// 2. Drop the cup, trying slots in round-robin order and skipping any whose
+	// approach or descent cannot be planned.
+	n := len(slots)
+	start := s.servingAreaSlotCounter.Load()
+	var lastErr error
+	for off := 0; off < n; off++ {
+		idx := slotIndex(start+uint64(off), n)
+		s.logger.Infof("place_full_cup_on_shelf: trying slot %d/%d", idx+1, n)
+		err := s.tryDropCupInSlot(ctx, slots[idx], shelfTopZ)
+		if err == nil {
+			// Next placement starts at the slot after the one just used.
+			s.servingAreaSlotCounter.Store(start + uint64(off) + 1)
+			s.logger.Infof("place_full_cup_on_shelf: placed cup in slot %d/%d", idx+1, n)
+			return nil
+		}
+		lastErr = err
+
+		// Operator cancel always wins.
+		if ctx.Err() != nil || cancelCtx.Err() != nil {
+			return fmt.Errorf("place_full_cup_on_shelf: cancelled: %w", err)
+		}
+
+		// Only planning failures (cup still held, arm unmoved) are skippable.
+		// Anything else — execution error, or any failure after the cup was
+		// released — bubbles up.
+		if !errors.Is(err, errMotionPlanning) {
+			return fmt.Errorf("place_full_cup_on_shelf: %w", err)
+		}
+		s.logger.Warnf("place_full_cup_on_shelf: slot %d/%d unreachable — trying next slot: %v", idx+1, n, err)
+	}
+	return fmt.Errorf("place_full_cup_on_shelf: all %d serving-area slot(s) unreachable; last error: %w", n, lastErr)
+}
+
+// tryDropCupInSlot drops the held cup at one serving-area slot: free-plan to the
+// approach pose above the slot, descend linearly to the drop pose
+// (claws-middle = shelfTopZ + shelfDropZOffsetMm), release, then retreat
+// linearly and close the gripper.
+//
+// CupGrabRelativePose is the same relative offset used at pickup (composed onto
+// the detected cup centroid) — composing it onto the placement anchor here
+// keeps the claws-to-cup geometry identical between grab and release, so the
+// cup lands centered on the slot.
+//
+// Returned errors split like tryGrabCup so placeFullCupOnShelf can react via
+// errors.Is:
+//   - wraps errMotionPlanning → the approach or descent could not be planned;
+//     the cup is still held and the arm has not committed to the slot, so the
+//     caller can try the next slot.
+//   - anything else → an execution error, or any failure after the cup was
+//     released; bubble up (do not try another slot with an empty gripper).
+func (s *beanjaminCoffee) tryDropCupInSlot(ctx context.Context, tileWorld r3.Vector, shelfTopZ float64) error {
 	dropAnchor := r3.Vector{
-		X: pick.tileWorld.X,
-		Y: pick.tileWorld.Y,
-		Z: pick.shelfTopZ + shelfDropZOffsetMm,
+		X: tileWorld.X,
+		Y: tileWorld.Y,
+		Z: shelfTopZ + shelfDropZOffsetMm,
 	}
 	dropPose := composeCupPose(dropAnchor, relativePoseToSpatial(s.cfg.CupGrabRelativePose))
 	approachPose := composeCupPose(dropAnchor, relativePoseToSpatial(s.cfg.CupApproachRelativePose))
 
 	approachPD := &poseData{pose: approachPose, refFrame: referenceframe.World, componentName: componentClaws}
 	dropPD := &poseData{pose: dropPose, refFrame: referenceframe.World, componentName: componentClaws}
+	s.logger.Infof("shelf placement: slot (x=%.1f, y=%.1f) drop_pose=%v approach_pose=%v",
+		tileWorld.X, tileWorld.Y, dropPose, approachPose)
 
-	s.logger.Infof("shelf placement: anchor world drop_pose=%v approach_pose=%v",
-		dropPose, approachPose)
-
-	// 3. Free planning to the approach pose.
+	// 1. Free planning to the approach pose. On a planning failure the arm has
+	// not moved and the cup is still held — caller can try the next slot.
 	if err := s.moveToRawPose(ctx, approachPD, nil, nil, nil); err != nil {
-		return fmt.Errorf("place_full_cup_on_shelf: approach: %w", err)
+		return fmt.Errorf("approach slot (x=%.1f, y=%.1f): %w", tileWorld.X, tileWorld.Y, err)
 	}
 
-	// 4. Linear descent to the drop pose.
+	// 2. Linear descent to the drop pose. A planning failure leaves the arm at
+	// the approach pose still holding the cup — caller can try the next slot.
 	if err := s.moveToRawPose(ctx, dropPD, defaultApproachConstraint, nil, nil); err != nil {
-		return fmt.Errorf("place_full_cup_on_shelf: descend: %w", err)
+		return fmt.Errorf("descend into slot (x=%.1f, y=%.1f): %w", tileWorld.X, tileWorld.Y, err)
 	}
 
-	// 5. Release the cup.
+	// 3. Release the cup. Past this point the cup is committed to this slot;
+	// the steps below strip any errMotionPlanning chain (%v) so the caller does
+	// not retry another slot with an empty gripper.
 	if err := s.gripper.Open(ctx, nil); err != nil {
-		return fmt.Errorf("place_full_cup_on_shelf: open gripper: %w", err)
+		return fmt.Errorf("open gripper to release cup: %w", err)
 	}
 	time.Sleep(gripperPause)
 
-	// 6. Linear retreat back to the approach pose.
+	// 4. Linear retreat back to the approach pose.
 	if err := s.moveToRawPose(ctx, approachPD, defaultApproachConstraint, nil, nil); err != nil {
-		return fmt.Errorf("place_full_cup_on_shelf: retreat: %w", err)
+		return fmt.Errorf("retreat after releasing cup (slot x=%.1f, y=%.1f): %v", tileWorld.X, tileWorld.Y, err)
 	}
 
-	// 7. Close the gripper for the next move.
+	// 5. Close the gripper for the next move.
 	if _, err := s.gripper.Grab(ctx, nil); err != nil {
-		return fmt.Errorf("place_full_cup_on_shelf: close gripper: %w", err)
+		return fmt.Errorf("close gripper after release: %w", err)
 	}
 	time.Sleep(gripperPause)
 	return nil
 }
 
 // runCupFlow exercises the full cup-handling path without brewing: for each of
-// count iterations it dynamically picks a cup, sets it under the machine,
-// retrieves it, and places it on the served shelf. It re-observes (all
-// vantages, all photos, merged) at the start of every iteration, so each
-// placement sees the cups left by previous iterations and picks the next free
-// tile. Intended for tuning multi-vantage detection + shelf placement on
-// hardware.
+// count iterations it dynamically picks a cup (sweeping observe poses until one
+// sees a cup), sets it under the machine, retrieves it, and places it on the
+// served shelf at the next round-robin slot. Intended for tuning the observe
+// sweep + shelf placement on hardware.
 //
 // It assumes the portafilter has been physically removed from the claws — the
 // flow never touches portafilter state. Requires dynamic_cup_pickup and
-// place_cup_on_shelf: the shelf tile is selected during each pickup
-// observation and consumed by placeFullCupOnShelf.
+// place_cup_in_serving_area: each placement advances the shelf-slot counter inside
+// placeFullCupOnShelf.
 func (s *beanjaminCoffee) runCupFlow(ctx context.Context, count int) (map[string]interface{}, error) {
 	if !s.cfg.DynamicCupPickup {
 		return nil, errors.New("run_cup_flow requires dynamic_cup_pickup=true")
 	}
-	if !s.cfg.PlaceCupOnShelf {
-		return nil, errors.New("run_cup_flow requires place_cup_on_shelf=true")
+	if !s.cfg.PlaceCupInServingArea {
+		return nil, errors.New("run_cup_flow requires place_cup_in_serving_area=true")
 	}
 
 	if !s.running.CompareAndSwap(false, true) {
