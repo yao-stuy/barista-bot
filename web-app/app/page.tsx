@@ -5,11 +5,12 @@ import Link from "next/link";
 import * as VIAM from "@viamrobotics/sdk";
 import Cookies from "js-cookie";
 import {
-  connectToViam,
   getQueue,
-  type QueueStatus,
+  hasCoffeeService,
+  type MachineQueueState,
   type ViamConnection,
 } from "./lib/viamClient";
+import { createConnectionManager } from "./lib/connectionManager";
 import {
   type Machine,
   type DailyOrderCount,
@@ -35,6 +36,10 @@ const PILL_BUTTON_BASE =
 const PILL_NEUTRAL = `${PILL_BUTTON_BASE} border-neutral-200 bg-white text-neutral-900 hover:bg-neutral-100`;
 const PILL_DANGER_ACTIVE = `${PILL_BUTTON_BASE} border-red-500 bg-red-50 text-red-600 hover:bg-red-100`;
 
+// A single transient getQueue RPC error shouldn't drop an otherwise-healthy
+// WebRTC channel — only tear down and re-dial after this many in a row.
+const MAX_QUEUE_FAILURES = 3;
+
 export default function Home() {
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
@@ -49,7 +54,7 @@ export default function Home() {
   >(null);
   const [viamClient, setViamClient] = useState<VIAM.ViamClient | null>(null);
   const [machineQueues, setMachineQueues] = useState<
-    Map<string, QueueStatus | null>
+    Map<string, MachineQueueState>
   >(new Map());
   const [panel, setPanel] = useState<Panel | null>(null);
   const [panelOrders, setPanelOrders] = useState<OrderRecord[] | null>(null);
@@ -64,42 +69,104 @@ export default function Home() {
     );
 
     let cancelled = false;
-    const connectionCache = new Map<string, Promise<ViamConnection>>();
+    // One connection per machine (keyed by partId), with shared dial-timeout
+    // and teardown behavior — same manager the kiosk uses.
+    const connections = createConnectionManager();
     let queueInterval: ReturnType<typeof setInterval> | undefined;
+    let machinesInterval: ReturnType<typeof setInterval> | undefined;
     let aggregatesInterval: ReturnType<typeof setInterval> | undefined;
     let currentClient: VIAM.ViamClient | null = null;
     let currentMachines: Machine[] = [];
 
+    // Consecutive getQueue failures per partId, so we only drop a connection
+    // after MAX_QUEUE_FAILURES rather than on every transient RPC error.
+    const queueFailures = new Map<string, number>();
+
+    const setQueue = (machineId: string, state: MachineQueueState) => {
+      if (cancelled) return;
+      setMachineQueues((prev) => {
+        const next = new Map(prev);
+        next.set(machineId, state);
+        return next;
+      });
+    };
+
+    const refreshOneQueue = async (m: Machine) => {
+      const partId = m.mainPartId;
+      if (!partId) return;
+      const machineId = m.id;
+
+      let conn: ViamConnection;
+      try {
+        // The manager dials with a timeout and evicts on failure, so a stuck
+        // dial can't wedge the pool and the next cycle re-dials cleanly.
+        conn = await connections.get(partId);
+      } catch (e) {
+        console.error(`failed to connect to ${machineId}:`, e);
+        queueFailures.delete(partId);
+        setQueue(machineId, { kind: "error" });
+        return;
+      }
+
+      try {
+        // A machine can be online and reachable without running the coffee
+        // service. That's not an error — keep the connection and mark it so
+        // the dashboard can show a distinct (yellow) state.
+        if (!(await hasCoffeeService(conn))) {
+          queueFailures.delete(partId);
+          setQueue(machineId, { kind: "no-service" });
+          return;
+        }
+        const q = await getQueue(conn);
+        queueFailures.delete(partId);
+        setQueue(machineId, { kind: "ok", status: q });
+      } catch (e) {
+        const failures = (queueFailures.get(partId) ?? 0) + 1;
+        queueFailures.set(partId, failures);
+        console.error(
+          `failed to fetch queue for ${machineId} (${failures}/${MAX_QUEUE_FAILURES}):`,
+          e
+        );
+        if (failures >= MAX_QUEUE_FAILURES) {
+          // Channel looks dead — tear it down so the next cycle re-dials.
+          connections.invalidate(partId);
+          queueFailures.delete(partId);
+        }
+        setQueue(machineId, { kind: "error" });
+      }
+    };
+
+    let queueRefreshInFlight = false;
     const refreshQueues = async () => {
-      for (const m of currentMachines) {
-        if (!m.online || !m.mainPartId) continue;
-        const partId = m.mainPartId;
-        const machineId = m.id;
-        let connPromise = connectionCache.get(partId);
-        if (!connPromise) {
-          connPromise = connectToViam(partId);
-          connectionCache.set(partId, connPromise);
+      // Skip if a prior cycle is still running so ticks can't pile up on a
+      // slow machine; the interval will catch the next one.
+      if (queueRefreshInFlight) return;
+      queueRefreshInFlight = true;
+      try {
+        const targets = currentMachines.filter((m) => m.online && m.mainPartId);
+        // Fan out across machines so one slow machine can't stretch the cycle.
+        await Promise.allSettled(targets.map(refreshOneQueue));
+      } finally {
+        queueRefreshInFlight = false;
+      }
+    };
+
+    // Re-list machines so online/offline status (and the status dot) stays
+    // live, and tear down the pooled connection of any machine that's no
+    // longer online — otherwise a dead channel lingers in the pool and the
+    // next cycle burns MAX_QUEUE_FAILURES before re-dialing when it returns.
+    const refreshMachines = async () => {
+      if (!currentClient) return;
+      try {
+        const found = await listMachines(currentClient);
+        if (cancelled) return;
+        for (const m of found) {
+          if (m.mainPartId && !m.online) connections.invalidate(m.mainPartId);
         }
-        try {
-          const conn = await connPromise;
-          const q = await getQueue(conn);
-          if (cancelled) return;
-          setMachineQueues((prev) => {
-            const next = new Map(prev);
-            next.set(machineId, q);
-            return next;
-          });
-        } catch (e) {
-          console.error(`failed to fetch queue for ${machineId}:`, e);
-          connectionCache.delete(partId);
-          if (!cancelled) {
-            setMachineQueues((prev) => {
-              const next = new Map(prev);
-              next.set(machineId, null);
-              return next;
-            });
-          }
-        }
+        currentMachines = found;
+        setMachines(found);
+      } catch (e) {
+        console.error("failed to refresh machines:", e);
       }
     };
 
@@ -130,6 +197,7 @@ export default function Home() {
     };
 
     refreshAllRef.current = () => {
+      refreshMachines();
       refreshQueues();
       refreshAggregates();
     };
@@ -162,6 +230,7 @@ export default function Home() {
         refreshQueues();
 
         queueInterval = setInterval(refreshQueues, 5000);
+        machinesInterval = setInterval(refreshMachines, 15000);
         aggregatesInterval = setInterval(refreshAggregates, 30000);
       } catch (e) {
         if (!cancelled) {
@@ -174,7 +243,9 @@ export default function Home() {
     return () => {
       cancelled = true;
       if (queueInterval) clearInterval(queueInterval);
+      if (machinesInterval) clearInterval(machinesInterval);
       if (aggregatesInterval) clearInterval(aggregatesInterval);
+      connections.closeAll();
     };
   }, []);
 
@@ -253,7 +324,11 @@ export default function Home() {
           .sort((a, b) => {
             const score = (m: Machine) => {
               const q = machineQueues.get(m.id);
-              if (q && q.is_busy && q.orders.some((o) => o.completed_at === ""))
+              if (
+                q?.kind === "ok" &&
+                q.status.is_busy &&
+                q.status.orders.some((o) => o.completed_at === "")
+              )
                 return 2;
               if (m.online) return 1;
               return 0;
