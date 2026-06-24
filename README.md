@@ -246,6 +246,8 @@ The save request includes a `tags` entry with the order UUID — this is what li
 | `brew_time_sec`            | float  | No       | Espresso brew duration in seconds (default: 8).                                                               |
 | `lungo_brew_time_sec`      | float  | No       | Lungo brew duration in seconds (default: 15).                                                                 |
 | `grind_time_sec`           | float  | No       | Bean grinding duration in seconds, applied to both regular and decaf grinders (default: 7.5).                 |
+| `gripper_hold_min_pos`     | float  | No       | Gripper jaw position (0–850) below which the gripper is considered closed/empty. Positions in `[min, max]` mean an object (cup or glass) is held; used to verify grabs and self-heal an open gripper at brew-cycle start (default: 430).                 |
+| `gripper_hold_max_pos`     | float  | No       | Gripper jaw position (0–850) above which the gripper is considered open (default: 685).                       |
 | `slow_movement_vel_degs_per_sec` | float | No    | Max joint velocity (degrees/sec) used when a step has a `LinearConstraint` without explicit `MoveOptions`, as well as for pivot and circular motions. Raise carefully — precision and contact steps rely on this (default: 25). |
 | `place_cup`                | bool   | No       | Enable cup placement step in the brew cycle.                                                                  |
 | `clean_after_use`          | bool   | No       | Enable cleaning step after each brew.                                                                         |
@@ -279,6 +281,7 @@ The save request includes a `tags` entry with the order UUID — this is what li
 | `glass_approach_relative_pose`        | object | When `dynamic_glass_pickup` is enabled | 6-DoF gripper offset composed onto the detected glass centroid for the pre-grab pose (same shape as `cup_approach_relative_pose`), tuned for the taller glass. |
 | `glass_grab_relative_pose`            | object | When `dynamic_glass_pickup` is enabled | 6-DoF gripper offset for the final glass grab pose. |
 | `glass_centroid_min_z_mm`             | float  | No       | Floor each glass detection's world-frame Z to this value. Default `0` disables. |
+| `track_held_geometry`                 | bool   | No       | When `true`, the vision-detected geometry of a picked-up cup/glass is attached to the gripper frame in the cached frame system as a `held-item` frame, so motion planning routes around the held item until it is set down (and is restored on each re-grab — the brewed cup from under the machine, the staged glass). Because the geometry comes from a vision detection, it requires a dynamic pickup path (`dynamic_cup_pickup` and/or `dynamic_glass_pickup`). The gripper-overlap collision pairs are allowed automatically on every move while an item is held; contact phases near a modeled surface (under the machine, the serving-area shelf, the empty-cup handoff) allow the held item against that surface too. The held-item frame is dropped when the frame system is rebuilt (`reset_world`, cancel recovery). Default `false`. |
 
 Glass pickup reuses `cup_photos_per_vantage` and `cup_pickup_max_attempts` (item-agnostic operational knobs); there are no glass-specific versions.
 
