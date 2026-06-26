@@ -37,8 +37,8 @@ const heldItemFrameName = "held-item"
 // (as lifted in observeVantage). It is expressed relative to the gripper frame
 // at the current (grab) pose and cached by label so a later re-grab of the same
 // item (reattachGeometry) can restore it without re-detecting. No-op when
-// track_held_geometry is off or geomWorld is nil (e.g. the static pickup path,
-// which has no detection).
+// track_held_geometry is off or geomWorld is nil (no detection geometry
+// available).
 func (s *beanjaminCoffee) attachDetectedGeometry(ctx context.Context, label string, geomWorld spatialmath.Geometry) error {
 	if !s.cfg.TrackHeldGeometry || geomWorld == nil {
 		return nil
@@ -204,29 +204,4 @@ func (s *beanjaminCoffee) heldItemSurfaceCollisions(pairs []AllowedCollision) []
 		return nil
 	}
 	return pairs
-}
-
-// geometryToWorld lifts a geometry given in cameraFrame coordinates into the
-// world frame, preserving its dimensions and orientation. Mirrors cameraToWorld
-// but for a full geometry rather than a single point.
-//
-// It deliberately does NOT use fs.Transform on a GeometriesInFrame: that path
-// applies only the parent-to-world transform and skips the source frame's own
-// transform (the "geometry tied to a frame" convention in FrameSystem.Transform),
-// which would drop the camera's mount transform. Instead it resolves the full
-// camera→world pose via a PoseInFrame (same as cameraToWorld) and applies it to
-// the geometry.
-func geometryToWorld(
-	fs *referenceframe.FrameSystem,
-	fsInputs referenceframe.FrameSystemInputs,
-	cameraFrame string,
-	geom spatialmath.Geometry,
-) (spatialmath.Geometry, error) {
-	pif := referenceframe.NewPoseInFrame(cameraFrame, spatialmath.NewZeroPose())
-	tf, err := fs.Transform(fsInputs.ToLinearInputs(), pif, referenceframe.World)
-	if err != nil {
-		return nil, fmt.Errorf("transform %q to world: %w", cameraFrame, err)
-	}
-	cameraToWorldPose := tf.(*referenceframe.PoseInFrame).Pose()
-	return geom.Transform(cameraToWorldPose), nil
 }

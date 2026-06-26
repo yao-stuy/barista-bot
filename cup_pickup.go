@@ -1,8 +1,8 @@
-// Package beanjamin: dynamic cup pickup.
+// Package beanjamin: vision-based cup pickup.
 //
-// pickCupDynamic replaces the static empty_cup grab in setCupForCoffee
-// when dynamic_cup_pickup is enabled. It sweeps the poses on the dedicated
-// camera-observe switch (camera_observe_pose_switcher_name) one at a time,
+// pickCupDynamic is how setCupForCoffee acquires the empty cup. It sweeps the
+// poses on the dedicated camera-observe switch
+// (camera_observe_pose_switcher_name) one at a time,
 // calling a vision service for cup detections at each. As soon as a pose
 // yields at least one detection the sweep stops — the next observe pose is
 // only tried when the current one failed to find a cup. Detections are lifted
@@ -27,6 +27,7 @@ import (
 	"github.com/golang/geo/r3"
 	toggleswitch "go.viam.com/rdk/components/switch"
 	"go.viam.com/rdk/module/trace"
+	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/services/vision"
 	"go.viam.com/rdk/spatialmath"
@@ -151,6 +152,70 @@ func cameraToWorld(
 	return worldPose.Pose().Point(), nil
 }
 
+// boxDims converts a diameter/height override into axis-aligned box extents:
+// width and depth both equal the diameter (a square footprint approximating the
+// round container), height equals the height.
+func (d *ContainerDimensions) boxDims() r3.Vector {
+	return r3.Vector{X: d.DiameterMm, Y: d.DiameterMm, Z: d.HeightMm}
+}
+
+// overriddenBox builds the held-item geometry from operator-supplied container
+// dimensions (cup_dimensions / glass_dimensions): an axis-aligned box
+// (orientation OZ=1) of the configured size, centered on the grasp centroid —
+// the point the gripper is sent to — rather than on a point-cloud midpoint.
+// Modeling a known-size container around its grasp point avoids a center skewed
+// by a point cloud that only captured part of the container. label is set on the
+// box.
+func overriddenBox(centroid r3.Vector, dims *ContainerDimensions, label string) (spatialmath.Geometry, error) {
+	box, err := spatialmath.NewBox(spatialmath.NewPoseFromPoint(centroid), dims.boxDims(), label)
+	if err != nil {
+		return nil, fmt.Errorf("new %s bounding box: %w", label, err)
+	}
+	return box, nil
+}
+
+// worldBoundingBox builds an axis-aligned bounding box (orientation OZ=1) in the
+// world frame around the given camera-frame point cloud. The cloud is
+// transformed into world coordinates and the box spans its world min/max
+// extents, centered at their midpoint. Returns a nil geometry for an empty
+// cloud. label is set on the returned box.
+func worldBoundingBox(
+	fs *referenceframe.FrameSystem,
+	fsInputs referenceframe.FrameSystemInputs,
+	cameraFrame string,
+	cloud pointcloud.PointCloud,
+	label string,
+) (spatialmath.Geometry, error) {
+	if cloud == nil || cloud.Size() == 0 {
+		return nil, nil
+	}
+
+	// Resolve the camera→world pose once and transform the whole cloud into world.
+	camPIF := referenceframe.NewPoseInFrame(cameraFrame, spatialmath.NewZeroPose())
+	tf, err := fs.Transform(fsInputs.ToLinearInputs(), camPIF, referenceframe.World)
+	if err != nil {
+		return nil, fmt.Errorf("transform %q to world: %w", cameraFrame, err)
+	}
+	camToWorld := tf.(*referenceframe.PoseInFrame).Pose()
+
+	worldCloud := pointcloud.NewBasicEmpty()
+	if err := pointcloud.ApplyOffset(cloud, camToWorld, worldCloud); err != nil {
+		return nil, fmt.Errorf("transform point cloud to world: %w", err)
+	}
+
+	meta := worldCloud.MetaData()
+	min := r3.Vector{X: meta.MinX, Y: meta.MinY, Z: meta.MinZ}
+	max := r3.Vector{X: meta.MaxX, Y: meta.MaxY, Z: meta.MaxZ}
+	center := min.Add(max).Mul(0.5)
+	dims := max.Sub(min)
+	pose := spatialmath.NewPoseFromPoint(center)
+	box, err := spatialmath.NewBox(pose, dims, label)
+	if err != nil {
+		return nil, fmt.Errorf("new bounding box: %w", err)
+	}
+	return box, nil
+}
+
 // gripperWorldPoint returns the world-frame position of the gripper — the
 // componentClaws frame the grab actually moves onto a cup/glass. Dynamic pickup
 // ranks detected items by proximity to this point (findCandidates), so the item
@@ -175,18 +240,19 @@ func (s *beanjaminCoffee) gripperWorldPoint(ctx context.Context) (r3.Vector, err
 // detection — its own vision service and observe poses, tuned for the taller
 // glass — fully independent of cup detection while sharing one implementation.
 type pickupTarget struct {
-	label            string              // "cup" / "glass" — logs, spans, errors
-	vision           vision.Service      // detector for this item
-	cameraName       string              // camera frame for centroid->world (shared)
-	observeSw        toggleswitch.Switch // switch holding the observe vantages
-	observeComponent string              // routing key for executeStep/switchForComponent
-	observeHomePose  string              // recovery pose name on observeSw
-	approachRel      *RelativePose       // gripper offset for the pre-grab pose
-	grabRel          *RelativePose       // gripper offset for the grab pose
-	photosPerVantage int                 // vision frames per observe pose
-	maxAttempts      int                 // full observe-and-grab attempts
-	centroidMinZMm   float64             // floor detection Z to this (0 = disabled)
-	noItemSpeak      string              // spoken on "nothing detected" before a retry wait
+	label            string               // "cup" / "glass" — logs, spans, errors
+	vision           vision.Service       // detector for this item
+	cameraName       string               // camera frame for centroid->world (shared)
+	observeSw        toggleswitch.Switch  // switch holding the observe vantages
+	observeComponent string               // routing key for executeStep/switchForComponent
+	observeHomePose  string               // recovery pose name on observeSw
+	approachRel      *RelativePose        // gripper offset for the pre-grab pose
+	grabRel          *RelativePose        // gripper offset for the grab pose
+	photosPerVantage int                  // vision frames per observe pose
+	maxAttempts      int                  // full observe-and-grab attempts
+	centroidMinZMm   float64              // floor detection Z to this (0 = disabled)
+	dimsOverride     *ContainerDimensions // predefined box size; nil uses point-cloud extents
+	noItemSpeak      string               // spoken on "nothing detected" before a retry wait
 }
 
 // cupPickupTarget describes dynamic cup pickup. Reproduces the values the cup
@@ -204,6 +270,7 @@ func (s *beanjaminCoffee) cupPickupTarget() *pickupTarget {
 		photosPerVantage: pickupPhotosPerVantage(s.cfg.CupPhotosPerVantage),
 		maxAttempts:      pickupMaxAttempts(s.cfg.CupPickupMaxAttempts),
 		centroidMinZMm:   s.cfg.CupCentroidMinZMm,
+		dimsOverride:     s.cfg.CupDimensions,
 		noItemSpeak:      "I don't see a cup yet — please place one on the shelf. Trying again in 15 seconds.",
 	}
 }
@@ -226,6 +293,7 @@ func (s *beanjaminCoffee) glassPickupTarget() *pickupTarget {
 		photosPerVantage: pickupPhotosPerVantage(s.cfg.CupPhotosPerVantage),
 		maxAttempts:      pickupMaxAttempts(s.cfg.CupPickupMaxAttempts),
 		centroidMinZMm:   s.cfg.GlassCentroidMinZMm,
+		dimsOverride:     s.cfg.GlassDimensions,
 		noItemSpeak:      "I don't see a glass yet — please place one on the top shelf. Trying again in 15 seconds.",
 	}
 }
@@ -270,11 +338,25 @@ func (s *beanjaminCoffee) observeVantage(ctx context.Context, t *pickupTarget) (
 		if err != nil {
 			return nil, err
 		}
-		// Lift the full detection geometry (not just its centroid) into world so
-		// the held-item tracker can attach the detected shape after the grab.
-		geomWorld, err := geometryToWorld(fs, fsInputs, t.cameraName, obj.Geometry)
+		// Build the detection geometry as a world-frame, axis-aligned (orientation
+		// OZ=1) box. By default this is the bounding box of the detection's point
+		// cloud (not the vision service's own geometry). When dimsOverride is
+		// configured, use the operator-supplied size centered on the grasp centroid
+		// instead — a known-size container is modeled around where it is actually
+		// grasped, sidestepping a skewed point-cloud midpoint. The held-item tracker
+		// attaches this shape to the gripper after the grab, and it is drawn in the
+		// saved snapshot.
+		var geomWorld spatialmath.Geometry
+		if t.dimsOverride != nil {
+			geomWorld, err = overriddenBox(world, t.dimsOverride, t.label)
+		} else {
+			geomWorld, err = worldBoundingBox(fs, fsInputs, t.cameraName, obj.PointCloud, t.label)
+		}
 		if err != nil {
 			return nil, err
+		}
+		if geomWorld == nil {
+			continue
 		}
 		if floor := t.centroidMinZMm; floor != 0 && world.Z < floor {
 			delta := floor - world.Z
@@ -288,7 +370,24 @@ func (s *beanjaminCoffee) observeVantage(ctx context.Context, t *pickupTarget) (
 		logger.Debugf("dynamic %s pickup: detection at camera-local %v -> world %v", t.label, local, world)
 		candidates = append(candidates, pickupCandidate{centroid: world, geom: geomWorld})
 	}
+
+	// Persist a frame-system snapshot augmented with the world-frame detection
+	// geometries to the motion-requests dir, so the observed cups/glasses can be
+	// loaded back into a FrameSystem and drawn in a local motion-tools visualizer.
+	s.saveObservedItemsFrameSystem(t.label, geometriesOf(candidates))
 	return candidates, nil
+}
+
+// geometriesOf extracts the world-frame geometries from a slice of candidates,
+// skipping any without a geometry. Used to feed the visualizer.
+func geometriesOf(candidates []pickupCandidate) []spatialmath.Geometry {
+	out := make([]spatialmath.Geometry, 0, len(candidates))
+	for _, c := range candidates {
+		if c.geom != nil {
+			out = append(out, c.geom)
+		}
+	}
+	return out
 }
 
 // observationPoseNames returns the names of every pose on the given observe
@@ -493,15 +592,14 @@ func (s *beanjaminCoffee) recoverToObserve(ctx, cancelCtx context.Context, t *pi
 	}
 }
 
-// pickCupDynamic picks an empty cup via the dynamic pipeline. Called by
-// setCupForCoffee when DynamicCupPickup=true.
+// pickCupDynamic picks an empty cup via the vision pipeline. Called by
+// setCupForCoffee.
 func (s *beanjaminCoffee) pickCupDynamic(ctx, cancelCtx context.Context) error {
 	return s.pickDynamic(ctx, cancelCtx, s.cupPickupTarget())
 }
 
-// pickGlassDynamic picks an iced-coffee glass via the dynamic pipeline (its own
-// vision service + observe switch). Called by fetchGlass when
-// DynamicGlassPickup=true.
+// pickGlassDynamic picks an iced-coffee glass via the vision pipeline (its own
+// vision service + observe switch). Called by fetchGlass (can_serve_iced).
 func (s *beanjaminCoffee) pickGlassDynamic(ctx, cancelCtx context.Context) error {
 	return s.pickDynamic(ctx, cancelCtx, s.glassPickupTarget())
 }
